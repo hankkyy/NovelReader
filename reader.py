@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/hankzhang/Desktop/novel/venv/bin/python3
 # -*- coding: utf-8 -*-
 """
 终端小说阅读器 (Stealth Edition)

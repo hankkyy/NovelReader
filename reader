@@ -361,16 +361,21 @@ def run_reader(stdscr, filepath, stealth=False):
                 msg_timer = 2 if chap_input else 0
             elif key in (curses.KEY_ENTER, 10, 13):
                 if chap_input:
-                    # 按输入的数字跳转
+                    # 按章节号搜索（不按数组索引）
                     target_ch = int(chap_input)
-                    if 1 <= target_ch <= len(chapters):
-                        chapter_list_offset = target_ch - 1
-                        chapter_index = target_ch - 1
-                        top_line = chapters[chapter_index][1]
+                    found = -1
+                    for idx, (t, _, _) in enumerate(chapters):
+                        if get_chapter_num(t) == target_ch:
+                            found = idx
+                            break
+                    if found >= 0:
+                        chapter_list_offset = found
+                        chapter_index = found
+                        top_line = chapters[found][1]
                         show_chapter_list = False
                         msg = f'跳转: 第{target_ch}章'
                     else:
-                        msg = f'章节不存在: {target_ch}'
+                        msg = f'章节不存在: 第{target_ch}章'
                     msg_timer = 2
                     chap_input = ''
                 else:

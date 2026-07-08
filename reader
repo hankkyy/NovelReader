@@ -279,7 +279,7 @@ def run_reader(stdscr, filepath, stealth=False):
                 bottom_text = f' PID: {os.getpid()}  Uptime: {top_line//60}h  Tasks: {len(chapters)}  '
             else:
                 ch = chapters[chapter_index][0] if chapter_index < len(chapters) else ''
-                bottom_text = f' {top_line}/{len(lines)} | ↑↓:滚动 ←→:换章 d:目录 Space:翻页 q:退出'
+                bottom_text = f' {top_line}/{len(lines)} | ↑↓:滚动 ←→:换章 d:目录 Space:翻页 s:隐身 Esc/q:退出'
                 if bookmark_line is not None:
                     bottom_text += f' 🔖{bookmark_line}'
 

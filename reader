@@ -129,6 +129,12 @@ def find_current_chapter(chapters, line_idx):
     return 0
 
 
+def get_chapter_num(title):
+    """从章节标题中提取数字，如 '第419章 xxx' → 419"""
+    m = re.match(r'第(\d+)章', title)
+    return int(m.group(1)) if m else 0
+
+
 # ─── Curses UI ──────────────────────────────────────────
 
 def set_terminal_title(title):
@@ -208,9 +214,10 @@ def run_reader(stdscr, filepath, stealth=False):
             # 正常模式：显示书名和进度
             total = len(chapters)
             ch_title = chapters[chapter_index][0] if chapter_index < len(chapters) else ''
+            ch_num = get_chapter_num(ch_title)
             if len(ch_title) > 40:
                 ch_title = ch_title[:37] + '...'
-            progress_text = f'《{book_name}》 {ch_title}  [{chapter_index+1}/{total}]'
+            progress_text = f'《{book_name}》 {ch_title}  [{ch_num}/{total}]'
             try:
                 stdscr.addstr(0, max(0, left_margin), progress_text[:content_width])
             except Exception:
@@ -272,7 +279,7 @@ def run_reader(stdscr, filepath, stealth=False):
                 bottom_text = f' PID: {os.getpid()}  Uptime: {top_line//60}h  Tasks: {len(chapters)}  '
             else:
                 ch = chapters[chapter_index][0] if chapter_index < len(chapters) else ''
-                bottom_text = f' {top_line}/{len(lines)} | jk:滚动 du:翻页 np:换章 c:目录 B:书签 q:退出'
+                bottom_text = f' {top_line}/{len(lines)} | ↑↓:滚动 ←→:换章 d:目录 Space:翻页 q:退出'
                 if bookmark_line is not None:
                     bottom_text += f' 🔖{bookmark_line}'
 
@@ -325,10 +332,10 @@ def run_reader(stdscr, filepath, stealth=False):
             if key == ord('q') or key == 27:
                 show_chapter_list = False
                 chap_input = ''
-            elif key == ord('j') or key == curses.KEY_DOWN:
+            elif key == ord('k') or key == curses.KEY_DOWN:
                 chapter_list_offset = min(chapter_list_offset + 1,
                                           max(0, len(chapters) - (height - 4)))
-            elif key == ord('k') or key == curses.KEY_UP:
+            elif key == ord('j') or key == curses.KEY_UP:
                 chapter_list_offset = max(0, chapter_list_offset - 1)
             elif key == ord('d') or key == curses.KEY_NPAGE:  # 章节目录翻页
                 step = max(1, (height - 5))
@@ -386,19 +393,11 @@ def run_reader(stdscr, filepath, stealth=False):
         if key == ord('q'):  # 退出
             break
 
-        elif key == ord('j') or key == curses.KEY_DOWN:
+        elif key == ord('k') or key == curses.KEY_DOWN:  # 下滚
             top_line = min(top_line + SCROLL_STEP, max(0, len(lines) - visible_lines))
 
-        elif key == ord('k') or key == curses.KEY_UP:
+        elif key == ord('j') or key == curses.KEY_UP:  # 上滚
             top_line = max(0, top_line - SCROLL_STEP)
-
-        elif key == ord('d') or key == curses.KEY_NPAGE:  # 下翻半页
-            step = max(1, int(visible_lines * PAGE_STEP_RATIO))
-            top_line = min(top_line + step, max(0, len(lines) - visible_lines))
-
-        elif key == ord('u') or key == curses.KEY_PPAGE:  # 上翻半页
-            step = max(1, int(visible_lines * PAGE_STEP_RATIO))
-            top_line = max(0, top_line - step)
 
         elif key == ord('f') or key == ord(' '):  # 下翻整页
             top_line = min(top_line + visible_lines, max(0, len(lines) - visible_lines))
@@ -406,27 +405,27 @@ def run_reader(stdscr, filepath, stealth=False):
         elif key == ord('b'):  # 上翻整页
             top_line = max(0, top_line - visible_lines)
 
-        elif key == ord('g'):  # 跳转到开头
+        elif key == ord('g'):  # 跳到开头
             top_line = 0
 
-        elif key == ord('G'):  # 跳转到结尾
+        elif key == ord('G'):  # 跳到结尾
             top_line = max(0, len(lines) - visible_lines)
 
-        elif key == ord('n'):  # 下一章
+        elif key == curses.KEY_RIGHT or key == ord('n'):  # 下一章（→ 或 n）
             if chapter_index < len(chapters) - 1:
                 chapter_index += 1
                 top_line = chapters[chapter_index][1]
                 msg = f'→ {chapters[chapter_index][0]}'
                 msg_timer = 2
 
-        elif key == ord('p'):  # 上一章
+        elif key == curses.KEY_LEFT or key == ord('p'):  # 上一章（← 或 p）
             if chapter_index > 0:
                 chapter_index -= 1
                 top_line = chapters[chapter_index][1]
                 msg = f'← {chapters[chapter_index][0]}'
                 msg_timer = 2
 
-        elif key == ord('c'):  # 章节目录
+        elif key == ord('d'):  # 目录
             show_chapter_list = True
             chapter_list_offset = chapter_index
 
@@ -497,23 +496,19 @@ def _draw_help(stdscr, height, width):
     lines = [
         '════════════ 按键帮助 ════════════',
         '',
-        '  j / ↓        下滚一行',
-        '  k / ↑        上滚一行',
-        '  d / PageDn   下翻半页',
-        '  u / PageUp   上翻半页',
-        '  f / Space    下翻整页',
-        '  b            上翻整页',
-        '  g            跳到开头',
-        '  G            跳到结尾',
-        '  n            下一章',
-        '  p            上一章',
-        '  c            章节目录',
-        '  c→输入数字   跳转到指定章',
-        '  B            添加书签',
-        "  '            跳转书签",
-        '  s            切换隐身模式',
-        '  h            帮助',
-        '  Esc / q      立即退出+清屏',
+        '  ↑ / ↓ / j / k  上下滚动',
+        '  Space / f       下翻整页',
+        '  b               上翻整页',
+        '  g / G           跳到开头/结尾',
+        '  → / n           下一章',
+        '  ← / p           上一章',
+        '  d               章节目录',
+        '   d→输入数字→回车  跳转到指定章',
+        '  B               添加书签',
+        "  '               跳转书签",
+        '  s               切换隐身模式',
+        '  h               帮助',
+        '  Esc / q         退出+清屏',
         '',
         '════════════════════════════════',
         '',
@@ -558,7 +553,9 @@ def _draw_chapter_list(stdscr, height, width, chapters, current_idx, offset, cha
             ch_title = ch_title[:panel_w - 9] + '...'
 
         prefix = ' → ' if idx == current_idx else '   '
-        line = f'{prefix}[{idx+1:3d}] {ch_title}'
+        ch_num = get_chapter_num(ch_title)
+        num_str = f'{ch_num:4d}' if ch_num > 0 else f'{idx+1:3d} '
+        line = f'{prefix}[{num_str}] {ch_title}'
         try:
             attr = curses.A_REVERSE if idx == current_idx else 0
             stdscr.addstr(start_y + 1 + i, start_x,

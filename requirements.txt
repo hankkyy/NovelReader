@@ -1,0 +1,4 @@
+playwright>=1.40
+beautifulsoup4>=4.11
+lxml>=4.9
+tqdm>=4.64

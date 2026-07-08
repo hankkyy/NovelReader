@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+novel - 笔趣阁小说下载器（Playwright 版）
+利用系统 Google Chrome 渲染 JS，复用一个浏览器实例下载。
+
+snapd.net 是当前更新最及时的笔趣阁镜像，章节数远超其他站点。
+
+用法：
+  python novel 188981                    # 下载全部章节
+  python novel 188981 --start 419        # 从第419章开始下载
+  python novel 188981 --start 419 --end 500   # 下载指定范围
+  python novel 188981 --start 419 -o ./output  # 指定输出目录
+
+依赖：
+  pip install playwright beautifulsoup4 lxml tqdm
+  playwright install chromium
+  (也需要系统已安装 Google Chrome)
+"""
+
+import os
+import sys
+import time
+import random
+import re
+import argparse
+
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+BASE_URL = 'https://m.snapd.net/read'
+PAGE_TIMEOUT = 30000
+JS_WAIT = 2500
+MAX_RETRIES = 2
+BROWSER_RESTART_EVERY = 80  # 每80章重启一次浏览器，防止内存泄漏
+
+
+def parse_chapter_html(html):
+    """从 HTML 提取章节正文"""
+    soup = BeautifulSoup(html, 'lxml')
+    chapter_div = soup.find('div', id='chaptercontent')
+    if not chapter_div:
+        return ''
+
+    raw = str(chapter_div)
+    parts = re.split(r'<br\s*/?>', raw)
+    clean = []
+    for part in parts:
+        t = re.sub(r'<[^>]+>', '', part).strip()
+        t = t.replace('　', '').strip()
+        if not t or len(t) < 2:
+            continue
+        if any(kw in t for kw in ['请收藏', '女儿的民族舞', '禽兽老师',
+                                   '点此报错', '加入书签']):
+            continue
+        clean.append(t)
+    return '\n\n'.join(clean)
+
+
+def safe_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', '', name).strip()
+
+
+def download_novel(book_id, start=1, end=None, output_dir='.', output_file=None):
+    print(f"\n{'='*60}")
+    print(f"  snapd.net 笔趣阁下载器 (Playwright)")
+    print(f"{'='*60}\n")
+
+    # ── 启动浏览器 ──
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(channel='chrome', headless=True)
+
+    try:
+        # ── 获取书籍信息 ──
+        info_url = f'{BASE_URL}/{book_id}/'
+        print(f"🔍 获取书籍信息: {info_url}")
+        info_page = browser.new_page()
+        info_page.goto(info_url, timeout=PAGE_TIMEOUT)
+        info_page.wait_for_timeout(JS_WAIT)
+        info_html = info_page.content()
+        info_page.close()
+
+        soup = BeautifulSoup(info_html, 'lxml')
+        book_name = None
+        meta = soup.find('meta', property='og:novel:book_name')
+        if meta and meta.get('content'):
+            book_name = meta['content'].strip()
+        if not book_name:
+            h1 = soup.find('h1')
+            if h1:
+                book_name = h1.get_text(strip=True)
+        if not book_name:
+            book_name = f'novel_{book_id}'
+
+        author = '未知'
+        meta_author = soup.find('meta', property='og:novel:author')
+        if meta_author and meta_author.get('content'):
+            author = meta_author['content'].strip()
+
+        total = 0
+        meta_chapter = soup.find('meta', property='og:novel:latest_chapter_name')
+        if meta_chapter and meta_chapter.get('content'):
+            match = re.search(r'(\d+)', meta_chapter['content'])
+            if match:
+                total = int(match.group(1))
+
+        if end is None:
+            end = total or 9999
+        if total == 0:
+            total = end
+
+        print(f"   📚 书名: 《{book_name}》")
+        print(f"   ✍  作者: {author}")
+        print(f"   📑 最新章节: 第{total}章")
+        print(f"   📥 下载范围: 第{start}章 ~ 第{end}章\n")
+
+        safe_name = safe_filename(book_name)
+        if output_file:
+            filepath = os.path.join(output_dir, output_file)
+        else:
+            filepath = os.path.join(output_dir, f'{safe_name}.txt')
+
+        # 断点续传
+        downloaded = set()
+        if os.path.exists(filepath):
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    m = re.match(r'(第\d+章)', line.strip())
+                    if m:
+                        downloaded.add(m.group(1))
+            if downloaded:
+                print(f"📂 已有 {len(downloaded)} 章，跳过\n")
+
+        # ── 逐章下载 ──
+        chapter_range = range(start, end + 1)
+        iterator = tqdm(chapter_range, desc='📥 下载进度', unit='章') if HAS_TQDM else chapter_range
+        new_count = 0
+        skip_count = 0
+        fail_count = 0
+
+        with open(filepath, 'a', encoding='utf-8') as f:
+            if not downloaded:
+                f.write(f'{book_name}\n\n作者：{author}\n来源：{BASE_URL}/{book_id}/\n')
+                f.write(f'共 {total} 章\n')
+                f.write('=' * 60 + '\n\n')
+
+            for i in iterator:
+                chapter_title = f'第{i}章'
+                if chapter_title in downloaded:
+                    skip_count += 1
+                    continue
+
+                # 每 BROWSER_RESTART_EVERY 章重启浏览器
+                if new_count > 0 and new_count % BROWSER_RESTART_EVERY == 0:
+                    browser.close()
+                    browser = playwright.chromium.launch(channel='chrome', headless=True)
+
+                url = f'{BASE_URL}/{book_id}/{i}.html'
+                content = ''
+
+                for attempt in range(MAX_RETRIES):
+                    page = None
+                    try:
+                        page = browser.new_page()
+                        page.goto(url, timeout=PAGE_TIMEOUT)
+                        page.wait_for_timeout(JS_WAIT)
+                        content = parse_chapter_html(page.content())
+                        page.close()
+                        page = None
+
+                        if content and len(content) > 20:
+                            break
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(1.5)
+                    except Exception as e:
+                        if page:
+                            page.close()
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(2)
+                        else:
+                            print(f"\n  ⚠ 第{i}章错误: {e}")
+
+                if not content or len(content) < 20:
+                    content = f'[下载失败: {url}]'
+                    fail_count += 1
+
+                f.write(f'{chapter_title}\n\n')
+                f.write(content)
+                f.write('\n\n' + '─' * 40 + '\n\n')
+                f.flush()
+
+                new_count += 1
+                time.sleep(random.uniform(0.2, 0.6))
+
+        print(f"\n{'='*60}")
+        print(f"  ✅ 下载完成: 《{book_name}》")
+        print(f"  📂 {filepath}")
+        print(f"  📊 新增 {new_count} 章，跳过 {skip_count} 章")
+        if fail_count:
+            print(f"  ⚠ {fail_count} 章失败，重跑即可续传")
+        print(f"{'='*60}\n")
+
+    finally:
+        browser.close()
+        playwright.stop()
+
+    return filepath
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='笔趣阁小说下载器 (Playwright)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python novel 188981                    # 下载全部
+  python novel 188981 --start 419        # 从419章开始
+  python novel 188981 --start 419 --end 500
+  python novel 188981 --start 419 -o ./output
+        """
+    )
+    parser.add_argument('book_id', help='书籍ID（从 snapd.net URL 获取）')
+    parser.add_argument('--start', type=int, default=1, help='起始章节号')
+    parser.add_argument('--end', type=int, default=None, help='结束章节号')
+    parser.add_argument('-o', '--output-dir', default='.', help='输出目录')
+    parser.add_argument('-f', '--output-file', default=None, help='输出文件名')
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    download_novel(args.book_id, args.start, args.end,
+                   args.output_dir, args.output_file)
+
+
+if __name__ == '__main__':
+    main()

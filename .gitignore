@@ -1,0 +1,20 @@
+# 下载的小说文件
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# 进度文件 (read by reader.py)
+# 这个可以提交也可以忽略
+# ~/.novel_progress.json 在用户目录，不会被提交

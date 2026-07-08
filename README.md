@@ -7,7 +7,7 @@
 ```
 novel/
 ├── novel              # 小说下载器（Playwright 版）
-├── reader.py          # 终端阅读器（Stealth Edition）
+├── reader          # 终端阅读器（Stealth Edition）
 ├── requirements.txt   # Python 依赖
 └── output/            # 下载的小说存放处（git 忽略）
 ```
@@ -69,7 +69,7 @@ venv/bin/python3 -m playwright install chromium
 
 ---
 
-## 二、终端阅读器 (`reader.py`)
+## 二、终端阅读器 (`reader`)
 
 ### 基本原理
 
@@ -83,9 +83,9 @@ venv/bin/python3 -m playwright install chromium
 ### 用法
 
 ```bash
-./reader.py output/书名.txt            # 正常模式
-./reader.py output/书名.txt --stealth  # 隐身模式
-./reader.py output/书名.txt --reset    # 重置进度
+./reader output/书名.txt            # 正常模式
+./reader output/书名.txt --stealth  # 隐身模式
+./reader output/书名.txt --reset    # 重置进度
 ```
 
 ### 完整快捷键
@@ -153,7 +153,7 @@ cd ~/Desktop/novel
 ./novel 188981 --start 419
 
 # Step 2: 阅读
-./reader.py output/三体.txt
+./reader output/三体.txt
 ```
 
 ---
@@ -175,7 +175,7 @@ cd ~/Desktop/novel
   → 每 80 章重启浏览器防内存泄漏
 ```
 
-### reader.py 阅读器
+### reader 阅读器
 
 ```
 打开 txt 文件
@@ -208,7 +208,7 @@ cd ~/Desktop/novel
 
 ### 关键文件
 - `novel` — 下载器主逻辑。核心函数：`download_novel(book_id, start, end, output_dir)`
-- `reader.py` — 阅读器主逻辑。核心函数：`run_reader(stdscr, filepath, stealth)`
+- `reader` — 阅读器主逻辑。核心函数：`run_reader(stdscr, filepath, stealth)`
 - `~/.novel_progress.json` — 阅读进度持久化文件
 
 ### 添加新的小说源

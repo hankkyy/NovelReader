@@ -153,7 +153,7 @@ cd ~/Desktop/biquge
 venv/bin/python3 novel 188981 --start 419
 
 # Step 2: 阅读
-venv/bin/python3 reader.py output/太后娘娘请开门，奴才来请安了.txt
+venv/bin/python3 reader.py output/三体.txt
 ```
 
 ---
@@ -192,10 +192,10 @@ venv/bin/python3 reader.py output/太后娘娘请开门，奴才来请安了.txt
 
 ```json
 {
-  "太后娘娘请开门，奴才来请安了.txt": {
+  "三体.txt": {
     "top_line": 12345,
     "bookmark": 10000,
-    "filepath": "/Users/xxx/biquge/output/太后娘娘请开门，奴才来请安了.txt"
+    "filepath": "/Users/xxx/biquge/output/三体.txt"
   }
 }
 ```

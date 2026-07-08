@@ -586,8 +586,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python reader.py 太后娘娘请开门.txt
-  python reader.py 太后娘娘请开门.txt --stealth   # 隐身模式
+  python reader.py 三体.txt
+  python reader.py 三体.txt --stealth   # 隐身模式
 
 隐身模式:
   - 窗口标题伪装为 sys-monitor

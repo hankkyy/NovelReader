@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+novel543 - 《太后娘娘请开门，奴才来请安了》免费下载器 (Playwright 版)
+
+为什么用 novel543:
+  snapd.net 对本地/无头浏览器反爬（返回整页广告），且每章分 4 页。
+  novel543 用普通 Playwright 就能拿到真实正文，每章仅 2 页，免费无需 API key。
+  唯一差别是繁体 —— 本脚本用 opencc 自动转成简体，输出与 snapd 一致。
+
+用法:
+  ./novel543 --start 488 --end 507 -o ./output -f 太后娘娘.txt
+  ./novel543 --start 488 --end 507 --trad        # 保留繁体不转换
+
+章节 URL 规律: https://www.novel543.com/0814646015/8095_<章节号>.html
+分页:          _2.html / _3.html ...（标题里有 "(1/2)" 标记总页数）
+"""
+
+import os
+import re
+import sys
+import time
+import argparse
+
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from opencc import OpenCC
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+URL_TMPL = 'https://www.novel543.com/{book}_{n}.html'      # 第1页
+URL_TMPL_P = 'https://www.novel543.com/{book}_{n}_{p}.html'  # 第p页
+DEFAULT_BOOK = '0814646015/8095'
+PAGE_TIMEOUT = 45000
+JS_WAIT = 2000
+MAX_PAGES_PER_CHAPTER = 8
+
+# 页尾/导航/站点垃圾（命中即从该行截断或跳过）
+FOOTER_MARK = ['溫馨提示', '温馨提示', '登錄用戶', '登录用户', '頁面右上角',
+               '页面右上角', '聯絡我們', '联络我们', '閱讀進度', '阅读进度',
+               '切換簡繁', '切换简繁']
+NAV_TOKENS = {'上一章', '下一章', '目錄', '目录', '首頁', '首页', '設置',
+              '收藏', '書頁', '顶部', '分享', '報錯', '上頁', '下頁',
+              '確定', '恢復默認', '/'}
+URL_RE = re.compile(r'https?://|www\.|\.com|\.cc|\.net')
+TITLE_RE = re.compile(r'(第\d+章.*?)\s*\((\d+)/(\d+)\)')
+
+
+def parse_page(html):
+    """返回 (标题, 总页数, 正文段落列表[繁体原文])"""
+    soup = BeautifulSoup(html, 'lxml')
+    title, total = None, 1
+
+    head = soup.select_one('.chapter-content')
+    if head:
+        first = head.get_text('\n', strip=True).split('\n')[0]
+        m = TITLE_RE.match(first)
+        if m:
+            title, total = m.group(1).strip(), int(m.group(3))
+        else:
+            title = first.strip()
+
+    body_el = soup.select_one('.content')
+    lines = []
+    if body_el:
+        for l in body_el.get_text('\n', strip=True).split('\n'):
+            l = l.strip()
+            if not l:
+                continue
+            if any(k in l for k in FOOTER_MARK):
+                break
+            if l in NAV_TOKENS or re.match(r'^第\d+章', l) or URL_RE.search(l):
+                continue
+            lines.append(l)
+    return title, total, lines
+
+
+def fetch_chapter(page, book, n):
+    """抓取整章（跟随分页），返回 (标题, 正文段落列表[繁体])"""
+    page.goto(URL_TMPL.format(book=book, n=n), timeout=PAGE_TIMEOUT)
+    page.wait_for_timeout(JS_WAIT)
+    title, total, lines = parse_page(page.content())
+    if not lines:
+        return title, []
+
+    total = min(max(total, 1), MAX_PAGES_PER_CHAPTER)
+    for p in range(2, total + 1):
+        page.goto(URL_TMPL_P.format(book=book, n=n, p=p), timeout=PAGE_TIMEOUT)
+        page.wait_for_timeout(JS_WAIT)
+        _, _, more = parse_page(page.content())
+        lines.extend(more)
+        time.sleep(0.2)
+    return title, lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description='novel543 免费下载器（自动繁转简）')
+    ap.add_argument('--start', type=int, required=True, help='起始章节号')
+    ap.add_argument('--end', type=int, required=True, help='结束章节号')
+    ap.add_argument('--book', default=DEFAULT_BOOK, help='书籍路径（默认本书）')
+    ap.add_argument('-o', '--output-dir', default='.', help='输出目录')
+    ap.add_argument('-f', '--output-file', default='太后娘娘.txt', help='输出文件名')
+    ap.add_argument('--trad', action='store_true', help='保留繁体（默认转简体）')
+    args = ap.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    filepath = os.path.join(args.output_dir, args.output_file)
+    cc = None if args.trad else OpenCC('t2s')
+
+    # 断点续传
+    downloaded = set()
+    if os.path.exists(filepath):
+        with open(filepath, encoding='utf-8') as f:
+            for line in f:
+                mm = re.match(r'(第\d+章)', line.strip())
+                if mm:
+                    downloaded.add(mm.group(1))
+
+    print(f"📥 novel543 → {filepath}  第{args.start}~{args.end}章"
+          f"{'（繁体）' if args.trad else '（转简体）'}")
+    if downloaded:
+        print(f"📂 已有 {len(downloaded)} 章，跳过")
+
+    rng = range(args.start, args.end + 1)
+    it = tqdm(rng, desc='下载', unit='章') if HAS_TQDM else rng
+    new = fail = 0
+
+    pw = sync_playwright().start()
+    b = pw.chromium.launch(channel='chrome', headless=True)
+    try:
+        page = b.new_page()
+        with open(filepath, 'a', encoding='utf-8') as f:
+            for n in it:
+                if f'第{n}章' in downloaded:
+                    continue
+                try:
+                    title, lines = fetch_chapter(page, args.book, n)
+                except Exception as e:
+                    print(f"\n  ⚠ 第{n}章错误: {e}")
+                    title, lines = f'第{n}章', []
+
+                if not lines:
+                    fail += 1
+                    title = title or f'第{n}章'
+                    body = f'[下载失败: 第{n}章]'
+                else:
+                    body = '\n\n'.join(lines)
+
+                title = title or f'第{n}章'
+                if cc:
+                    title = cc.convert(title)
+                    body = cc.convert(body)
+
+                f.write(f'{title}\n\n{body}\n\n' + '─' * 40 + '\n\n')
+                f.flush()
+                new += 1
+    finally:
+        b.close()
+        pw.stop()
+
+    print(f"\n✅ 完成: {filepath}  新增 {new} 章" + (f"，{fail} 章失败" if fail else ""))
+
+
+if __name__ == '__main__':
+    main()

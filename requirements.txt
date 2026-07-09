@@ -3,3 +3,4 @@ beautifulsoup4>=4.11
 lxml>=4.9
 tqdm>=4.64
 typing_extensions>=4.0
+opencc>=1.4

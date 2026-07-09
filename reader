@@ -1,4 +1,4 @@
-#!/tmp/biquge-venv/bin/python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 终端小说阅读器 (Stealth Edition)
@@ -162,6 +162,7 @@ def run_reader(stdscr, filepath, stealth=False):
     show_help = False
     use_stealth = stealth
     show_chapter_list = False
+    peek_hidden = False   # 短暂隐藏（保留进度，一键切回）
     chapter_list_offset = 0
     chap_input = ''   # 章节跳转数字输入缓冲
     msg = ''
@@ -193,7 +194,22 @@ def run_reader(stdscr, filepath, stealth=False):
 
         stdscr.erase()
 
-        # ── 渲染顶部状态栏 ──
+        # ── 短暂隐藏：显示一个假的空闲 shell 提示符 ──
+        if peek_hidden:
+            _draw_decoy(stdscr, height, width)
+            stdscr.refresh()
+            try:
+                key = stdscr.getch()
+            except Exception:
+                continue
+            if key == 9 or key == ord('\t'):   # Tab: 再按一下切回阅读
+                peek_hidden = False
+            elif key == 27:                    # Esc: 仍可一键退出+清屏
+                break
+            # 其余按键忽略（假装是空闲终端，不回显）
+            continue
+
+
         book_name = os.path.basename(filepath).replace('.txt', '')
         if len(book_name) > content_width - 15:
             book_name = book_name[:content_width - 18] + '...'
@@ -244,34 +260,46 @@ def run_reader(stdscr, filepath, stealth=False):
             text_end_row = height - 1  # 最后一行留给状态
 
             row = text_start_row
+            title_line = chapters[chapter_index][1] if chapter_index < len(chapters) else -1
             for i in range(top_line, len(lines)):
                 if row >= text_end_row:
                     break
                 line = lines[i]
 
                 if use_stealth:
-                    # 隐身模式：加假日志前缀
-                    prefix = FAKE_PREFIXES[i % len(FAKE_PREFIXES)]
+                    # 隐身模式：假日志前缀 + 时间戳
+                    log_prefix = FAKE_PREFIXES[i % len(FAKE_PREFIXES)]
                     ts_hour = 9 + (i // 60) % 14
                     ts_min = (i * 7) % 60
                     ts_sec = (i * 13) % 60
-                    fake_line = f'{prefix} [{ts_hour:02d}:{ts_min:02d}:{ts_sec:02d}] {line}'
+                    prefix = f'{log_prefix} [{ts_hour:02d}:{ts_min:02d}:{ts_sec:02d}] '
                 else:
-                    fake_line = line
+                    prefix = ''
 
-                # 截断以适应宽度
-                display = _fit_line(fake_line, content_width)
+                # 关键修复：给前缀预留宽度，正文按剩余宽度换行，避免被截断丢字
+                prefix_w = _text_width(prefix)
+                text_width = max(8, content_width - prefix_w)
+                segments = _wrap_line(line, text_width)
 
-                try:
-                    attr = 0
-                    # 章节标题高亮（用下划线代替颜色）
-                    if i == chapters[chapter_index][1] if chapter_index < len(chapters) else False:
-                        attr |= curses.A_UNDERLINE
-                    stdscr.addstr(row, left_margin, display[:width - left_margin], attr)
-                except Exception:
-                    pass
+                is_title = (i == title_line)
+                for seg_idx, seg in enumerate(segments):
+                    if row >= text_end_row:
+                        break
+                    if use_stealth:
+                        # 续行用等宽空格对齐，读起来像换行后的日志
+                        line_prefix = prefix if seg_idx == 0 else ' ' * prefix_w
+                        display = _fit_line(line_prefix + seg, content_width)
+                    else:
+                        display = _fit_line(seg, content_width)
 
-                row += 1
+                    try:
+                        # 章节标题高亮（用下划线代替颜色）
+                        attr = curses.A_UNDERLINE if is_title else 0
+                        stdscr.addstr(row, left_margin, display[:width - left_margin], attr)
+                    except Exception:
+                        pass
+
+                    row += 1
 
         # ── 底部状态栏 ──
         try:
@@ -279,7 +307,7 @@ def run_reader(stdscr, filepath, stealth=False):
                 bottom_text = f' PID: {os.getpid()}  Uptime: {top_line//60}h  Tasks: {len(chapters)}  '
             else:
                 ch = chapters[chapter_index][0] if chapter_index < len(chapters) else ''
-                bottom_text = f' {top_line}/{len(lines)} | ↑↓:滚动 ←→:换章 d:目录 Space:翻页 s:隐身 Esc/q:退出'
+                bottom_text = f' {top_line}/{len(lines)} | ↑↓:滚动 ←→:换章 d:目录 s:隐身 Tab:隐藏 Esc:退出'
                 if bookmark_line is not None:
                     bottom_text += f' 🔖{bookmark_line}'
 
@@ -441,6 +469,9 @@ def run_reader(stdscr, filepath, stealth=False):
             msg = '隐身模式 ON' if use_stealth else '隐身模式 OFF'
             msg_timer = 2
 
+        elif key == 9 or key == ord('\t'):  # Tab: 短暂隐藏（假 shell，再按一下切回）
+            peek_hidden = True
+
         elif key == ord('B'):  # 添加/更新书签
             bookmark_line = top_line
             msg = f'书签已保存 (行 {bookmark_line})'
@@ -477,6 +508,41 @@ def run_reader(stdscr, filepath, stealth=False):
     sys.stdout.flush()
 
 
+def _char_width(ch):
+    """中文/全角字符占 2 列，其余占 1 列"""
+    if '一' <= ch <= '鿿' or '　' <= ch <= '〿' or '＀' <= ch <= '￯':
+        return 2
+    return 1
+
+
+def _text_width(s):
+    """字符串的终端显示宽度（CJK 宽度感知）"""
+    return sum(_char_width(c) for c in s)
+
+
+def _wrap_line(line, max_width):
+    """按显示宽度换行（CJK 宽度感知），返回若干段；空行返回 ['']"""
+    if not line:
+        return ['']
+    if max_width < 1:
+        max_width = 1
+    segments = []
+    cur = []
+    cur_w = 0
+    for ch in line:
+        w = _char_width(ch)
+        if cur_w + w > max_width and cur:
+            segments.append(''.join(cur))
+            cur = [ch]
+            cur_w = w
+        else:
+            cur.append(ch)
+            cur_w += w
+    if cur:
+        segments.append(''.join(cur))
+    return segments
+
+
 def _fit_line(line, max_width):
     """处理中文宽度，截断到合适长度"""
     if not line:
@@ -484,7 +550,7 @@ def _fit_line(line, max_width):
     width = 0
     result = []
     for ch in line:
-        w = 2 if '一' <= ch <= '鿿' or '　' <= ch <= '〿' or '＀' <= ch <= '￯' else 1
+        w = _char_width(ch)
         if width + w > max_width:
             break
         result.append(ch)
@@ -494,6 +560,23 @@ def _fit_line(line, max_width):
     if pad > 0:
         result.append(' ' * pad)
     return ''.join(result)
+
+
+def _draw_decoy(stdscr, height, width):
+    """短暂隐藏时显示的假空闲终端（一个 shell 提示符 + 假光标）"""
+    user = os.environ.get('USER') or 'user'
+    try:
+        host = os.uname().nodename.split('.')[0]
+    except Exception:
+        host = 'localhost'
+    prompt = f'{user}@{host} ~ % '
+    try:
+        stdscr.addstr(0, 0, prompt[:max(0, width - 1)])
+        cx = min(len(prompt), width - 2)
+        if cx >= 0:
+            stdscr.addstr(0, cx, ' ', curses.A_REVERSE)  # 假光标块
+    except Exception:
+        pass
 
 
 def _draw_help(stdscr, height, width):
@@ -512,6 +595,7 @@ def _draw_help(stdscr, height, width):
         '  B               添加书签',
         "  '               跳转书签",
         '  s               切换隐身模式',
+        '  Tab             短暂隐藏(再按切回)',
         '  h               帮助',
         '  Esc / q         退出+清屏',
         '',

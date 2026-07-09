@@ -1,32 +1,36 @@
-#!/tmp/biquge-venv/bin/python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-novel - 笔趣阁小说下载器（Playwright 版）
-利用系统 Google Chrome 渲染 JS，复用一个浏览器实例下载。
+novel - 笔趣阁小说下载器 (Firecrawl 版)
 
-snapd.net 是当前更新最及时的笔趣阁镜像，章节数远超其他站点。
+为什么用 Firecrawl:
+  snapd.net 对无头/本地浏览器有反爬，会返回“假章节”（整页广告）。
+  Firecrawl 用真实浏览器指纹 + 代理抓取，拿到的是真正的正文。
+  本下载器自动跟随分页（xxx.html → xxx_2.html → ...）拼接整章，一章不丢。
 
-用法：
-  python novel 188981                    # 下载全部章节
-  python novel 188981 --start 419        # 从第419章开始下载
-  python novel 188981 --start 419 --end 500   # 下载指定范围
+准备:
+  1. 到 https://firecrawl.dev 免费注册，拿到 API key（形如 fc-xxxxxxxx）
+  2. 设置环境变量:  export FIRECRAWL_API_KEY=fc-xxxxxxxx
+
+用法:
+  python novel 188981                          # 下载全部章节
+  python novel 188981 --start 419              # 从第419章开始
+  python novel 188981 --start 419 --end 500    # 指定范围
   python novel 188981 --start 419 -o ./output  # 指定输出目录
+  python novel 188981 --start 419 -f 诛仙.txt   # 指定文件名
 
-依赖：
-  pip install playwright beautifulsoup4 lxml tqdm
-  playwright install chromium
-  (也需要系统已安装 Google Chrome)
+说明:
+  - 默认断点续传：已存在的“第N章”会跳过，不重复消耗额度。
+  - 想清掉旧的残缺/广告章节，请下载到新文件，或先删除旧 txt。
 """
 
 import os
 import sys
-import time
-import random
 import re
+import time
 import argparse
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+import requests
 
 try:
     from tqdm import tqdm
@@ -34,195 +38,219 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+# ─── 配置 ───────────────────────────────────────────────
 BASE_URL = 'https://m.snapd.net/read'
-PAGE_TIMEOUT = 30000
-JS_WAIT = 2500
-MAX_RETRIES = 2
-BROWSER_RESTART_EVERY = 80  # 每80章重启一次浏览器，防止内存泄漏
+FIRECRAWL_ENDPOINT = 'https://api.firecrawl.dev/v2/scrape'
+API_KEY = os.environ.get('FIRECRAWL_API_KEY', '').strip()
+
+REQ_TIMEOUT = 120           # 单次抓取超时（秒）
+MAX_RETRIES = 3
+RETRY_WAIT = 3
+MAX_PAGES_PER_CHAPTER = 30  # 单章分页安全上限
+
+# 正文段落的句末标点（用于识别注入的广告行——广告行不以句末标点结尾）
+END_PUNC = '。！？"”…』》.!?～~'
+# 页首/导航垃圾
+HEADER_JUNK = ['字体：', '护眼', '关灯', 'home', 'arrow', 'chevron', '●', 'loaded']
+# URL / 站点水印（正文绝不会出现，命中即广告）
+URL_RE = re.compile(r'(https?://|www\.|\.com|\.net|\.cc|·cc|bqg|srsp|qsww)')
+# 分页标记 "第(1/4)页"
+PAGE_RE = re.compile(r'第\((\d+)/(\d+)\)页')
 
 
-def parse_chapter_html(html):
-    """从 HTML 提取章节正文"""
-    soup = BeautifulSoup(html, 'lxml')
-    chapter_div = soup.find('div', id='chaptercontent')
-    if not chapter_div:
+# ─── Firecrawl 抓取 ─────────────────────────────────────
+
+def scrape_markdown(url):
+    """通过 Firecrawl 抓取页面，返回 markdown 正文。失败返回 ''。"""
+    headers = {
+        'Authorization': f'Bearer {API_KEY}',
+        'Content-Type': 'application/json',
+    }
+    payload = {
+        'url': url,
+        'formats': ['markdown'],
+        'onlyMainContent': True,
+        'waitFor': 2500,
+    }
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.post(FIRECRAWL_ENDPOINT, headers=headers,
+                              json=payload, timeout=REQ_TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                md = (data.get('data') or {}).get('markdown', '')
+                if data.get('success') and md:
+                    return md
+                # 200 但无内容，重试
+            elif r.status_code in (401, 403):
+                raise SystemExit(f"❌ Firecrawl 认证失败 ({r.status_code})，"
+                                 f"检查 FIRECRAWL_API_KEY。{r.text[:200]}")
+            elif r.status_code == 402:
+                raise SystemExit(f"❌ Firecrawl 额度不足 (402)。{r.text[:200]}")
+            elif r.status_code == 429:
+                time.sleep(RETRY_WAIT * (attempt + 2))
+                continue
+        except requests.RequestException:
+            pass
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_WAIT)
+    return ''
+
+
+# ─── 正文提取 ───────────────────────────────────────────
+
+def extract_body(md):
+    """
+    从 Firecrawl markdown 提取干净正文。
+    返回 (段落列表, 总页数)。会剔除页首导航、页尾 URL/收藏/分页标记，
+    以及注入的一行广告（页尾、不以句末标点结尾的那行）。
+    """
+    m = PAGE_RE.search(md)
+    total = int(m.group(2)) if m else 1
+
+    lines = [l.strip().replace('　', '') for l in md.split('\n') if l.strip()]
+
+    # 找页尾起点：请收藏 / 分页标记 / 报错收藏按钮 / URL
+    cut = len(lines)
+    for i, l in enumerate(lines):
+        if ('请收藏' in l or PAGE_RE.search(l) or '点击关闭' in l
+                or '点此报错' in l or '加入书签' in l or URL_RE.search(l)):
+            cut = i
+            break
+    body = lines[:cut]
+
+    # 剔除页首导航垃圾 + 章节内导航行
+    body = [l for l in body
+            if not any(k in l for k in HEADER_JUNK)
+            and '上一章' not in l and '下一章' not in l and l != '目录'
+            and not URL_RE.search(l)]
+
+    # 注入的单行广告：页尾那行若不以句末标点结尾，即广告，删掉
+    if body and body[-1] and body[-1][-1] not in END_PUNC:
+        body.pop()
+
+    return body, total
+
+
+def fetch_full_chapter(book_id, i):
+    """抓取整章：xxx.html → xxx_2.html → ... 自动翻页拼接，返回完整正文。"""
+    base = f'{BASE_URL}/{book_id}/{i}'
+    md = scrape_markdown(f'{base}.html')
+    if not md:
+        return ''
+    body, total = extract_body(md)
+    if not body:
         return ''
 
-    raw = str(chapter_div)
-    parts = re.split(r'<br\s*/?>', raw)
-    clean = []
-    for part in parts:
-        t = re.sub(r'<[^>]+>', '', part).strip()
-        t = t.replace('　', '').strip()
-        if not t or len(t) < 2:
+    parts = list(body)
+    total = min(max(total, 1), MAX_PAGES_PER_CHAPTER)
+    for p in range(2, total + 1):
+        pmd = scrape_markdown(f'{base}_{p}.html')
+        if not pmd:
             continue
-        if any(kw in t for kw in ['请收藏', '女儿的民族舞', '禽兽老师',
-                                   '点此报错', '加入书签']):
-            continue
-        clean.append(t)
-    return '\n\n'.join(clean)
+        pbody, _ = extract_body(pmd)
+        parts.extend(pbody)
+        time.sleep(0.3)
+
+    return '\n\n'.join(parts)
 
 
 def safe_filename(name):
     return re.sub(r'[\\/*?:"<>|]', '', name).strip()
 
 
+# ─── 下载主流程 ─────────────────────────────────────────
+
 def download_novel(book_id, start=1, end=None, output_dir='.', output_file=None):
+    if not API_KEY:
+        raise SystemExit(
+            "❌ 未设置 FIRECRAWL_API_KEY。\n"
+            "   请到 https://firecrawl.dev 免费获取 key，然后:\n"
+            "   export FIRECRAWL_API_KEY=fc-xxxxxxxx")
+
     print(f"\n{'='*60}")
-    print(f"  snapd.net 笔趣阁下载器 (Playwright)")
+    print(f"  snapd.net 笔趣阁下载器 (Firecrawl)")
     print(f"{'='*60}\n")
 
-    # ── 启动浏览器 ──
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(channel='chrome', headless=True)
+    if end is None:
+        end = 9999
+    total_hint = end
 
-    try:
-        # ── 获取书籍信息 ──
-        info_url = f'{BASE_URL}/{book_id}/'
-        print(f"🔍 获取书籍信息: {info_url}")
-        info_page = browser.new_page()
-        info_page.goto(info_url, timeout=PAGE_TIMEOUT)
-        info_page.wait_for_timeout(JS_WAIT)
-        info_html = info_page.content()
-        info_page.close()
+    if output_file:
+        filepath = os.path.join(output_dir, output_file)
+        book_name = os.path.splitext(output_file)[0]
+    else:
+        book_name = f'novel_{book_id}'
+        filepath = os.path.join(output_dir, f'{book_name}.txt')
 
-        soup = BeautifulSoup(info_html, 'lxml')
-        book_name = None
-        meta = soup.find('meta', property='og:novel:book_name')
-        if meta and meta.get('content'):
-            book_name = meta['content'].strip()
-        if not book_name:
-            h1 = soup.find('h1')
-            if h1:
-                book_name = h1.get_text(strip=True)
-        if not book_name:
-            book_name = f'novel_{book_id}'
+    print(f"   📚 输出: {filepath}")
+    print(f"   📥 范围: 第{start}章 ~ 第{end}章\n")
 
-        author = '未知'
-        meta_author = soup.find('meta', property='og:novel:author')
-        if meta_author and meta_author.get('content'):
-            author = meta_author['content'].strip()
+    # 断点续传：扫描已下载章节
+    downloaded = set()
+    if os.path.exists(filepath):
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                mm = re.match(r'(第\d+章)', line.strip())
+                if mm:
+                    downloaded.add(mm.group(1))
+        if downloaded:
+            print(f"📂 已有 {len(downloaded)} 章，跳过\n")
 
-        total = 0
-        meta_chapter = soup.find('meta', property='og:novel:latest_chapter_name')
-        if meta_chapter and meta_chapter.get('content'):
-            match = re.search(r'(\d+)', meta_chapter['content'])
-            if match:
-                total = int(match.group(1))
+    chapter_range = range(start, end + 1)
+    iterator = (tqdm(chapter_range, desc='📥 下载', unit='章')
+                if HAS_TQDM else chapter_range)
 
-        if end is None:
-            end = total or 9999
-        if total == 0:
-            total = end
+    new_count = skip_count = fail_count = 0
 
-        print(f"   📚 书名: 《{book_name}》")
-        print(f"   ✍  作者: {author}")
-        print(f"   📑 最新章节: 第{total}章")
-        print(f"   📥 下载范围: 第{start}章 ~ 第{end}章\n")
+    with open(filepath, 'a', encoding='utf-8') as f:
+        if not downloaded:
+            f.write(f'{book_name}\n\n来源：{BASE_URL}/{book_id}/\n')
+            f.write('=' * 60 + '\n\n')
 
-        safe_name = safe_filename(book_name)
-        if output_file:
-            filepath = os.path.join(output_dir, output_file)
-        else:
-            filepath = os.path.join(output_dir, f'{safe_name}.txt')
+        for i in iterator:
+            chapter_title = f'第{i}章'
+            if chapter_title in downloaded:
+                skip_count += 1
+                continue
 
-        # 断点续传
-        downloaded = set()
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
-                for line in f:
-                    m = re.match(r'(第\d+章)', line.strip())
-                    if m:
-                        downloaded.add(m.group(1))
-            if downloaded:
-                print(f"📂 已有 {len(downloaded)} 章，跳过\n")
+            content = ''
+            try:
+                content = fetch_full_chapter(book_id, i)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"\n  ⚠ 第{i}章错误: {e}")
 
-        # ── 逐章下载 ──
-        chapter_range = range(start, end + 1)
-        iterator = tqdm(chapter_range, desc='📥 下载进度', unit='章') if HAS_TQDM else chapter_range
-        new_count = 0
-        skip_count = 0
-        fail_count = 0
+            if not content or len(content) < 20:
+                content = f'[下载失败: {BASE_URL}/{book_id}/{i}.html]'
+                fail_count += 1
 
-        with open(filepath, 'a', encoding='utf-8') as f:
-            if not downloaded:
-                f.write(f'{book_name}\n\n作者：{author}\n来源：{BASE_URL}/{book_id}/\n')
-                f.write(f'共 {total} 章\n')
-                f.write('=' * 60 + '\n\n')
+            f.write(f'{chapter_title}\n\n')
+            f.write(content)
+            f.write('\n\n' + '─' * 40 + '\n\n')
+            f.flush()
 
-            for i in iterator:
-                chapter_title = f'第{i}章'
-                if chapter_title in downloaded:
-                    skip_count += 1
-                    continue
+            new_count += 1
 
-                # 每 BROWSER_RESTART_EVERY 章重启浏览器
-                if new_count > 0 and new_count % BROWSER_RESTART_EVERY == 0:
-                    browser.close()
-                    browser = playwright.chromium.launch(channel='chrome', headless=True)
-
-                url = f'{BASE_URL}/{book_id}/{i}.html'
-                content = ''
-
-                for attempt in range(MAX_RETRIES):
-                    page = None
-                    try:
-                        page = browser.new_page()
-                        page.goto(url, timeout=PAGE_TIMEOUT)
-                        page.wait_for_timeout(JS_WAIT)
-                        content = parse_chapter_html(page.content())
-                        page.close()
-                        page = None
-
-                        if content and len(content) > 20:
-                            break
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(1.5)
-                    except Exception as e:
-                        if page:
-                            page.close()
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(2)
-                        else:
-                            print(f"\n  ⚠ 第{i}章错误: {e}")
-
-                if not content or len(content) < 20:
-                    content = f'[下载失败: {url}]'
-                    fail_count += 1
-
-                f.write(f'{chapter_title}\n\n')
-                f.write(content)
-                f.write('\n\n' + '─' * 40 + '\n\n')
-                f.flush()
-
-                new_count += 1
-                time.sleep(random.uniform(0.2, 0.6))
-
-        print(f"\n{'='*60}")
-        print(f"  ✅ 下载完成: 《{book_name}》")
-        print(f"  📂 {filepath}")
-        print(f"  📊 新增 {new_count} 章，跳过 {skip_count} 章")
-        if fail_count:
-            print(f"  ⚠ {fail_count} 章失败，重跑即可续传")
-        print(f"{'='*60}\n")
-
-    finally:
-        browser.close()
-        playwright.stop()
+    print(f"\n{'='*60}")
+    print(f"  ✅ 完成: {filepath}")
+    print(f"  📊 新增 {new_count} 章，跳过 {skip_count} 章")
+    if fail_count:
+        print(f"  ⚠ {fail_count} 章失败，重跑即可续传")
+    print(f"{'='*60}\n")
 
     return filepath
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='笔趣阁小说下载器 (Playwright)',
+        description='笔趣阁小说下载器 (Firecrawl 版)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python novel 188981                    # 下载全部
-  python novel 188981 --start 419        # 从419章开始
-  python novel 188981 --start 419 --end 500
-  python novel 188981 --start 419 -o ./output
+  export FIRECRAWL_API_KEY=fc-xxxxxxxx
+  python novel 188981 --start 419 --end 500 -o ./output -f 诛仙.txt
         """
     )
     parser.add_argument('book_id', help='书籍ID（从 snapd.net URL 获取）')
